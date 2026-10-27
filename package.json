@@ -21,6 +21,7 @@
     "src"
   ],
   "scripts": {
+    "test": "bun test --preload @opentui/solid/preload",
     "build": "bun script/build.ts",
     "check": "tsc --noEmit",
     "usage": "bun src/usage.ts"

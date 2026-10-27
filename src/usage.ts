@@ -7,6 +7,8 @@ export type ProviderUsage = {
   name: string
   windows: UsageWindow[]
   error?: string
+  retryAfter?: number
+  stale?: boolean
 }
 
 type OauthEntry = {
@@ -53,8 +55,16 @@ function pct(value: unknown): number | undefined {
 }
 
 async function fetchJson(url: string, headers: Record<string, string>, signal?: AbortSignal) {
-  const response = await fetch(url, { headers, signal })
-  if (!response.ok) throw new Error(`http ${response.status}`)
+  const timeout = AbortSignal.timeout(10_000)
+  const response = await fetch(url, { headers, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+  if (!response.ok) {
+    const retry = response.headers.get("Retry-After")
+    const seconds = retry === null ? NaN : Number(retry)
+    const retryAfter = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry ?? "") - Date.now())
+    throw Object.assign(new Error(`http ${response.status}`), {
+      retryAfter: Number.isFinite(retryAfter) ? retryAfter : undefined,
+    })
+  }
   return response.json() as Promise<Record<string, any>>
 }
 
@@ -95,6 +105,16 @@ async function fetchOpenai(auth: Record<string, OauthEntry>, signal?: AbortSigna
   const entry = oauthEntry(auth, "openai")
   if (!entry) return undefined
   if (expired(entry)) return { name: "openai", windows: [], error: "auth" } satisfies ProviderUsage
+  // Direct-use ChatGPT plan tokens authorize the public API, not backend-api.
+  // OpenAI directs these users to https://chatgpt.com/settings/usage.
+  try {
+    const claims = JSON.parse(Buffer.from(entry.access!.split(".")[1] ?? "", "base64url").toString())
+    if (typeof claims.scope === "string" && claims.scope.split(" ").includes("chatgpt.tokens.use.direct")) {
+      return { name: "openai", windows: [], error: "usage unavailable" } satisfies ProviderUsage
+    }
+  } catch {
+    // Legacy tokens need not contain readable JWT claims.
+  }
   const headers: Record<string, string> = {
     Authorization: `Bearer ${entry.access}`,
     Accept: "application/json",
@@ -154,22 +174,72 @@ async function fetchCursor(auth: Record<string, OauthEntry>, signal?: AbortSigna
 
 const FETCHERS = [fetchOpenai, fetchAnthropic, fetchCursor]
 
-/** Fetch usage for all configured providers. Never throws; failures become `error` entries. */
+/** Fetch usage once. Provider failures become error entries; credential reads can throw. */
 export async function collectUsage(signal?: AbortSignal, credentials?: Record<string, OauthEntry>): Promise<ProviderUsage[]> {
   const auth = credentials ?? await readAuth()
   const names = ["openai", "anthropic", "cursor"]
   const results = await Promise.allSettled(FETCHERS.map((fetcher) => fetcher(auth, signal)))
   return results.flatMap((result, index) => {
-    if (result.status === "fulfilled") return result.value ? [result.value] : []
-    return [{ name: names[index], windows: [], error: String(result.reason?.message ?? result.reason) }]
+    if (result.status === "fulfilled") {
+      if (!result.value) return []
+      return [{ ...result.value, error: result.value.error ?? (result.value.windows.length === 0 ? "usage unavailable" : undefined) }]
+    }
+    return [{
+      name: names[index], windows: [], error: String(result.reason?.message ?? result.reason),
+      retryAfter: result.reason?.retryAfter,
+    }]
   })
+}
+
+export function createUsageCollector() {
+  const cache = new Map<string, {
+    credential: OauthEntry
+    usage: ProviderUsage
+    nextPoll: number
+    failures: number
+  }>()
+  return async (signal: AbortSignal | undefined, auth: Record<string, OauthEntry>) => {
+    for (const [name, previous] of cache) {
+      const current = oauthEntry(auth, name)
+      if (!current || current.access !== previous.credential.access || current.accountId !== previous.credential.accountId) {
+        cache.delete(name)
+      }
+    }
+    const due = Object.fromEntries(Object.entries(auth).filter(([name]) => Date.now() >= (cache.get(name)?.nextPoll ?? 0)))
+    const results = await collectUsage(signal, due)
+    if (signal?.aborted) return []
+    for (const result of results) {
+      const previous = cache.get(result.name)
+      const failures = result.error ? (previous?.failures ?? 0) + 1 : 0
+      const delay = result.error
+        ? Math.max(result.retryAfter ?? 0, Math.min(3_600_000, 300_000 * 2 ** Math.min(failures - 1, 4)))
+        : result.name === "anthropic" ? 300_000 : 60_000
+      const value = result.error && previous?.usage.windows.length
+        ? { ...result, windows: previous.usage.windows, stale: true }
+        : result
+      cache.set(result.name, {
+        credential: auth[result.name]!, usage: value, nextPoll: Date.now() + delay, failures,
+      })
+    }
+    return ["openai", "anthropic", "cursor"].flatMap((name) => {
+      const value = cache.get(name)?.usage
+      return value ? [value] : []
+    })
+  }
+}
+
+export function usageStatus(provider: ProviderUsage) {
+  if (provider.error === "http 429") return "rate limited"
+  if (provider.error === "auth" || provider.error === "http 401" || provider.error === "http 403") return "auth required"
+  if (provider.error === "usage unavailable") return "usage unavailable"
+  return "unavailable"
 }
 
 export function formatUsage(usage: ProviderUsage[]) {
   return usage
     .map((provider) => {
-      if (provider.windows.length === 0) return `${provider.name} !`
-      return `${provider.name} ${provider.windows.map((window) => `${window.label} ${window.pct}%`).join(" ")}`
+      if (provider.windows.length === 0) return `${provider.name} ${usageStatus(provider)}`
+      return `${provider.name} ${provider.windows.map((window) => `${window.label} ${window.pct}%`).join(" ")}${provider.stale ? " (stale)" : ""}`
     })
     .join("  ·  ")
 }

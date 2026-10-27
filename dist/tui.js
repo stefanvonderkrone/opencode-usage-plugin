@@ -48,9 +48,16 @@ function pct(value) {
   return Math.min(100, Math.max(0, Math.round(value)));
 }
 async function fetchJson(url, headers, signal) {
-  const response = await fetch(url, { headers, signal });
-  if (!response.ok)
-    throw new Error(`http ${response.status}`);
+  const timeout = AbortSignal.timeout(1e4);
+  const response = await fetch(url, { headers, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  if (!response.ok) {
+    const retry = response.headers.get("Retry-After");
+    const seconds = retry === null ? NaN : Number(retry);
+    const retryAfter = Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(retry ?? "") - Date.now());
+    throw Object.assign(new Error(`http ${response.status}`), {
+      retryAfter: Number.isFinite(retryAfter) ? retryAfter : undefined
+    });
+  }
   return response.json();
 }
 async function fetchAnthropic(auth, signal) {
@@ -93,6 +100,12 @@ async function fetchOpenai(auth, signal) {
     return;
   if (expired(entry))
     return { name: "openai", windows: [], error: "auth" };
+  try {
+    const claims = JSON.parse(Buffer.from(entry.access.split(".")[1] ?? "", "base64url").toString());
+    if (typeof claims.scope === "string" && claims.scope.split(" ").includes("chatgpt.tokens.use.direct")) {
+      return { name: "openai", windows: [], error: "usage unavailable" };
+    }
+  } catch {}
   const headers = {
     Authorization: `Bearer ${entry.access}`,
     Accept: "application/json"
@@ -146,10 +159,58 @@ async function collectUsage(signal, credentials) {
   const names = ["openai", "anthropic", "cursor"];
   const results = await Promise.allSettled(FETCHERS.map((fetcher) => fetcher(auth, signal)));
   return results.flatMap((result, index) => {
-    if (result.status === "fulfilled")
-      return result.value ? [result.value] : [];
-    return [{ name: names[index], windows: [], error: String(result.reason?.message ?? result.reason) }];
+    if (result.status === "fulfilled") {
+      if (!result.value)
+        return [];
+      return [{ ...result.value, error: result.value.error ?? (result.value.windows.length === 0 ? "usage unavailable" : undefined) }];
+    }
+    return [{
+      name: names[index],
+      windows: [],
+      error: String(result.reason?.message ?? result.reason),
+      retryAfter: result.reason?.retryAfter
+    }];
   });
+}
+function createUsageCollector() {
+  const cache = new Map;
+  return async (signal, auth) => {
+    for (const [name, previous] of cache) {
+      const current = oauthEntry(auth, name);
+      if (!current || current.access !== previous.credential.access || current.accountId !== previous.credential.accountId) {
+        cache.delete(name);
+      }
+    }
+    const due = Object.fromEntries(Object.entries(auth).filter(([name]) => Date.now() >= (cache.get(name)?.nextPoll ?? 0)));
+    const results = await collectUsage(signal, due);
+    if (signal?.aborted)
+      return [];
+    for (const result of results) {
+      const previous = cache.get(result.name);
+      const failures = result.error ? (previous?.failures ?? 0) + 1 : 0;
+      const delay = result.error ? Math.max(result.retryAfter ?? 0, Math.min(3600000, 300000 * 2 ** Math.min(failures - 1, 4))) : result.name === "anthropic" ? 300000 : 60000;
+      const value = result.error && previous?.usage.windows.length ? { ...result, windows: previous.usage.windows, stale: true } : result;
+      cache.set(result.name, {
+        credential: auth[result.name],
+        usage: value,
+        nextPoll: Date.now() + delay,
+        failures
+      });
+    }
+    return ["openai", "anthropic", "cursor"].flatMap((name) => {
+      const value = cache.get(name)?.usage;
+      return value ? [value] : [];
+    });
+  };
+}
+function usageStatus(provider) {
+  if (provider.error === "http 429")
+    return "rate limited";
+  if (provider.error === "auth" || provider.error === "http 401" || provider.error === "http 403")
+    return "auth required";
+  if (provider.error === "usage unavailable")
+    return "usage unavailable";
+  return "unavailable";
 }
 if (false) {}
 
@@ -160,10 +221,10 @@ var tui_default = Plugin.define({
   setup(context) {
     const controller = new AbortController;
     const [usage, setUsage] = createSignal([]);
-    const last = new Map;
+    const collectUsage2 = createUsageCollector();
     const poll = async () => {
       const credentials = await context.client.credential.list({
-        signal: controller.signal
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(1e4)])
       });
       const auth = Object.fromEntries(credentials.flatMap((credential) => {
         if (!credential.active || credential.value.type !== "oauth")
@@ -177,27 +238,28 @@ var tui_default = Plugin.define({
           accountId: typeof accountId === "string" ? accountId : undefined
         }]];
       }));
-      const results = await collectUsage(controller.signal, auth);
+      const results = await collectUsage2(controller.signal, auth);
       if (controller.signal.aborted)
         return;
-      for (const provider of results) {
-        const previous = last.get(provider.name);
-        if (provider.error && previous && previous.windows.length > 0)
-          continue;
-        last.set(provider.name, provider);
-      }
-      setUsage([...last.values()]);
+      setUsage(results);
     };
-    const refresh = () => poll().catch((error) => {
-      if (controller.signal.aborted)
-        return;
-      context.ui.toast.show({
-        message: `Usage: ${String(error)}`,
-        variant: "warning"
-      });
-    });
+    let timer;
+    const refresh = async () => {
+      try {
+        await poll();
+      } catch {
+        if (!controller.signal.aborted) {
+          context.ui.toast.show({
+            message: "Usage: cannot read credentials",
+            variant: "warning"
+          });
+        }
+      } finally {
+        if (!controller.signal.aborted)
+          timer = setTimeout(() => void refresh(), POLL_INTERVAL);
+      }
+    };
     refresh();
-    const timer = setInterval(() => void refresh(), POLL_INTERVAL);
     const Usage = () => {
       const color = (pct2) => {
         if (pct2 >= 90)
@@ -214,9 +276,12 @@ var tui_default = Plugin.define({
           var _el$ = _$createElement("box"), _el$2 = _$createElement("text");
           _$insertNode(_el$, _el$2);
           _$setProp(_el$, "width", "100%");
+          _$setProp(_el$, "height", 1);
           _$setProp(_el$, "flexShrink", 0);
           _$setProp(_el$, "paddingLeft", 2);
           _$setProp(_el$, "paddingRight", 2);
+          _$setProp(_el$2, "wrapMode", "none");
+          _$setProp(_el$2, "truncate", true);
           _$insert(_el$2, _$createComponent(For, {
             get each() {
               return usage();
@@ -228,7 +293,7 @@ var tui_default = Plugin.define({
               get fallback() {
                 return (() => {
                   var _el$3 = _$createElement("span");
-                  _$insertNode(_el$3, _$createTextNode(`!`));
+                  _$insert(_el$3, () => usageStatus(provider));
                   _$effect((_$p) => _$setProp(_el$3, "style", {
                     fg: context.theme.text.feedback.warning.base
                   }, _$p));
@@ -241,43 +306,31 @@ var tui_default = Plugin.define({
                     return provider.windows;
                   },
                   children: (window, windowIndex) => [_$memo(() => windowIndex() > 0 ? " " : ""), _$memo(() => window.label), " ", (() => {
-                    var _el$5 = _$createElement("span"), _el$6 = _$createTextNode(`%`);
-                    _$insertNode(_el$5, _el$6);
-                    _$insert(_el$5, () => window.pct, _el$6);
-                    _$effect((_$p) => _$setProp(_el$5, "style", {
+                    var _el$4 = _$createElement("span"), _el$5 = _$createTextNode(`%`);
+                    _$insertNode(_el$4, _el$5);
+                    _$insert(_el$4, () => window.pct, _el$5);
+                    _$effect((_$p) => _$setProp(_el$4, "style", {
                       fg: color(window.pct)
                     }, _$p));
-                    return _el$5;
+                    return _el$4;
                   })()]
                 });
               }
-            })]
+            }), _$memo(() => provider.stale ? " (stale)" : "")]
           }));
           _$effect((_$p) => _$setProp(_el$2, "fg", context.theme.text.muted, _$p));
           return _el$;
         }
       });
     };
-    const stopHome = context.ui.slot({
-      after: "home.footer",
+    const stopUsage = context.ui.slot({
+      append: "app",
       render: Usage
-    });
-    const stopSession = context.ui.slot({
-      after: "prompt.footer",
-      render: (input) => _$createComponent(Show, {
-        get when() {
-          return input.sessionID;
-        },
-        get children() {
-          return _$createComponent(Usage, {});
-        }
-      })
     });
     return () => {
       controller.abort();
-      clearInterval(timer);
-      stopHome();
-      stopSession();
+      clearTimeout(timer);
+      stopUsage();
     };
   }
 });
