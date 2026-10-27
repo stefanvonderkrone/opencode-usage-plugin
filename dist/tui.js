@@ -8,14 +8,30 @@ import { insert as _$insert } from "@opentui/solid";
 import { createComponent as _$createComponent } from "@opentui/solid";
 import { setProp as _$setProp } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
+import { Plugin } from "@opencode/plugin/tui";
 import { createSignal, For, Show } from "solid-js";
 
 // src/usage.ts
-import os from "os";
-import path from "path";
-var AUTH_PATH = path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode", "auth.json");
 async function readAuth() {
-  return Bun.file(AUTH_PATH).json().catch(() => ({}));
+  const child = Bun.spawn(["opencode", "auth", "export"], { stdout: "pipe", stderr: "inherit" });
+  const data = await new Response(child.stdout).json();
+  if (await child.exited !== 0 || !Array.isArray(data))
+    throw new Error("Cannot read OpenCode credentials");
+  return Object.fromEntries(data.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || !("active" in entry) || entry.active !== true || !("integrationID" in entry) || typeof entry.integrationID !== "string" || !("value" in entry))
+      return [];
+    const value = entry.value;
+    if (!value || typeof value !== "object" || !("type" in value) || value.type !== "oauth" || !("access" in value) || typeof value.access !== "string")
+      return [];
+    const metadata = "metadata" in value ? value.metadata : undefined;
+    const accountId = metadata && typeof metadata === "object" && "accountID" in metadata ? metadata.accountID : undefined;
+    return [[entry.integrationID, {
+      type: "oauth",
+      access: value.access,
+      expires: "expires" in value && typeof value.expires === "number" ? value.expires : undefined,
+      accountId: typeof accountId === "string" ? accountId : undefined
+    }]];
+  }));
 }
 function oauthEntry(auth, provider) {
   const entry = auth[provider];
@@ -125,8 +141,8 @@ async function fetchCursor(auth, signal) {
   return { name: "cursor", windows };
 }
 var FETCHERS = [fetchOpenai, fetchAnthropic, fetchCursor];
-async function collectUsage(signal) {
-  const auth = await readAuth();
+async function collectUsage(signal, credentials) {
+  const auth = credentials ?? await readAuth();
   const names = ["openai", "anthropic", "cursor"];
   const results = await Promise.allSettled(FETCHERS.map((fetcher) => fetcher(auth, signal)));
   return results.flatMap((result, index) => {
@@ -139,94 +155,132 @@ if (false) {}
 
 // src/tui.tsx
 var POLL_INTERVAL = 60000;
-var tui = async (api) => {
-  const [usage, setUsage] = createSignal([]);
-  const last = new Map;
-  const poll = async () => {
-    const results = await collectUsage(api.lifecycle.signal);
-    for (const provider of results) {
-      const previous = last.get(provider.name);
-      if (provider.error && previous && previous.windows.length > 0)
-        continue;
-      last.set(provider.name, provider);
-    }
-    setUsage([...last.values()]);
-  };
-  poll();
-  const timer = setInterval(() => void poll(), POLL_INTERVAL);
-  api.lifecycle.onDispose(() => clearInterval(timer));
-  api.slots.register({
-    order: 100,
-    slots: {
-      app_bottom(ctx) {
-        const theme = () => ctx.theme.current;
-        const color = (pct2) => {
-          if (pct2 >= 90)
-            return theme().error;
-          if (pct2 >= 70)
-            return theme().warning;
-          return theme().text;
-        };
-        return _$createComponent(Show, {
-          get when() {
-            return usage().length > 0;
-          },
-          get children() {
-            var _el$ = _$createElement("box"), _el$2 = _$createElement("text");
-            _$insertNode(_el$, _el$2);
-            _$setProp(_el$, "width", "100%");
-            _$setProp(_el$, "flexShrink", 0);
-            _$setProp(_el$, "paddingLeft", 2);
-            _$setProp(_el$, "paddingRight", 2);
-            _$insert(_el$2, _$createComponent(For, {
-              get each() {
-                return usage();
-              },
-              children: (provider, index) => [_$memo(() => index() > 0 ? "  \xB7  " : ""), _$memo(() => provider.name), " ", _$createComponent(Show, {
-                get when() {
-                  return provider.windows.length > 0;
-                },
-                get fallback() {
-                  return (() => {
-                    var _el$3 = _$createElement("span");
-                    _$insertNode(_el$3, _$createTextNode(`!`));
-                    _$effect((_$p) => _$setProp(_el$3, "style", {
-                      fg: theme().warning
-                    }, _$p));
-                    return _el$3;
-                  })();
-                },
-                get children() {
-                  return _$createComponent(For, {
-                    get each() {
-                      return provider.windows;
-                    },
-                    children: (window, windowIndex) => [_$memo(() => windowIndex() > 0 ? " " : ""), _$memo(() => window.label), " ", (() => {
-                      var _el$5 = _$createElement("span"), _el$6 = _$createTextNode(`%`);
-                      _$insertNode(_el$5, _el$6);
-                      _$insert(_el$5, () => window.pct, _el$6);
-                      _$effect((_$p) => _$setProp(_el$5, "style", {
-                        fg: color(window.pct)
-                      }, _$p));
-                      return _el$5;
-                    })()]
-                  });
-                }
-              })]
-            }));
-            _$effect((_$p) => _$setProp(_el$2, "fg", theme().textMuted, _$p));
-            return _el$;
-          }
-        });
-      }
-    }
-  });
-};
-var plugin = {
+var tui_default = Plugin.define({
   id: "opencode-usage-plugin",
-  tui
-};
-var tui_default = plugin;
+  setup(context) {
+    const controller = new AbortController;
+    const [usage, setUsage] = createSignal([]);
+    const last = new Map;
+    const poll = async () => {
+      const credentials = await context.client.credential.list({
+        signal: controller.signal
+      });
+      const auth = Object.fromEntries(credentials.flatMap((credential) => {
+        if (!credential.active || credential.value.type !== "oauth")
+          return [];
+        const value = credential.value;
+        const accountId = value.metadata?.accountID;
+        return [[credential.integrationID, {
+          type: value.type,
+          access: value.access,
+          expires: value.expires,
+          accountId: typeof accountId === "string" ? accountId : undefined
+        }]];
+      }));
+      const results = await collectUsage(controller.signal, auth);
+      if (controller.signal.aborted)
+        return;
+      for (const provider of results) {
+        const previous = last.get(provider.name);
+        if (provider.error && previous && previous.windows.length > 0)
+          continue;
+        last.set(provider.name, provider);
+      }
+      setUsage([...last.values()]);
+    };
+    const refresh = () => poll().catch((error) => {
+      if (controller.signal.aborted)
+        return;
+      context.ui.toast.show({
+        message: `Usage: ${String(error)}`,
+        variant: "warning"
+      });
+    });
+    refresh();
+    const timer = setInterval(() => void refresh(), POLL_INTERVAL);
+    const Usage = () => {
+      const color = (pct2) => {
+        if (pct2 >= 90)
+          return context.theme.text.feedback.error.base;
+        if (pct2 >= 70)
+          return context.theme.text.feedback.warning.base;
+        return context.theme.text.base;
+      };
+      return _$createComponent(Show, {
+        get when() {
+          return usage().length > 0;
+        },
+        get children() {
+          var _el$ = _$createElement("box"), _el$2 = _$createElement("text");
+          _$insertNode(_el$, _el$2);
+          _$setProp(_el$, "width", "100%");
+          _$setProp(_el$, "flexShrink", 0);
+          _$setProp(_el$, "paddingLeft", 2);
+          _$setProp(_el$, "paddingRight", 2);
+          _$insert(_el$2, _$createComponent(For, {
+            get each() {
+              return usage();
+            },
+            children: (provider, index) => [_$memo(() => index() > 0 ? "  \xB7  " : ""), _$memo(() => provider.name), " ", _$createComponent(Show, {
+              get when() {
+                return provider.windows.length > 0;
+              },
+              get fallback() {
+                return (() => {
+                  var _el$3 = _$createElement("span");
+                  _$insertNode(_el$3, _$createTextNode(`!`));
+                  _$effect((_$p) => _$setProp(_el$3, "style", {
+                    fg: context.theme.text.feedback.warning.base
+                  }, _$p));
+                  return _el$3;
+                })();
+              },
+              get children() {
+                return _$createComponent(For, {
+                  get each() {
+                    return provider.windows;
+                  },
+                  children: (window, windowIndex) => [_$memo(() => windowIndex() > 0 ? " " : ""), _$memo(() => window.label), " ", (() => {
+                    var _el$5 = _$createElement("span"), _el$6 = _$createTextNode(`%`);
+                    _$insertNode(_el$5, _el$6);
+                    _$insert(_el$5, () => window.pct, _el$6);
+                    _$effect((_$p) => _$setProp(_el$5, "style", {
+                      fg: color(window.pct)
+                    }, _$p));
+                    return _el$5;
+                  })()]
+                });
+              }
+            })]
+          }));
+          _$effect((_$p) => _$setProp(_el$2, "fg", context.theme.text.muted, _$p));
+          return _el$;
+        }
+      });
+    };
+    const stopHome = context.ui.slot({
+      after: "home.footer",
+      render: Usage
+    });
+    const stopSession = context.ui.slot({
+      after: "prompt.footer",
+      render: (input) => _$createComponent(Show, {
+        get when() {
+          return input.sessionID;
+        },
+        get children() {
+          return _$createComponent(Usage, {});
+        }
+      })
+    });
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+      stopHome();
+      stopSession();
+    };
+  }
+});
 export {
   tui_default as default
 };

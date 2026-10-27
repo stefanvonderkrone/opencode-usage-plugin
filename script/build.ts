@@ -9,7 +9,7 @@ const result = await Bun.build({
   outdir: "dist",
   format: "esm",
   target: "bun",
-  external: ["@opentui/core", "@opentui/solid", "solid-js", "@opencode-ai/plugin"],
+  external: ["@opentui/core", "@opentui/solid", "solid-js", "@opencode/plugin"],
   plugins: [createSolidTransformPlugin({ moduleName: "@opentui/solid" })],
 })
 

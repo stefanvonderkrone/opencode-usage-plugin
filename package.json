@@ -1,7 +1,7 @@
 {
   "name": "opencode-usage-plugin",
   "version": "0.1.0",
-  "description": "opencode TUI plugin that shows provider usage percentages (OpenAI, Anthropic, Cursor) in the app_bottom slot",
+  "description": "OpenCode v2 CLI plugin that shows provider usage percentages in home and session footers",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -16,6 +16,7 @@
     }
   },
   "files": [
+    "tui.js",
     "dist",
     "src"
   ],
@@ -24,13 +25,18 @@
     "check": "tsc --noEmit",
     "usage": "bun src/usage.ts"
   },
-  "dependencies": {
-    "@opentui/solid": "0.4.5",
-    "solid-js": "1.9.12"
+  "peerDependencies": {
+    "@opencode/plugin": "^2.1.4",
+    "@opentui/core": "^0.7.0",
+    "@opentui/solid": "^0.7.0",
+    "solid-js": ">=1.9.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.27",
-    "@opentui/core": "0.4.5",
+    "@opencode/plugin": "2.1.4",
+    "@opencode/theme": "2.1.4",
+    "@opentui/core": "0.7.0",
+    "@opentui/solid": "0.7.0",
+    "solid-js": "1.9.12",
     "@types/bun": "^1.2.0",
     "typescript": "^5.7.0"
   }

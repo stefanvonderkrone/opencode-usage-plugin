@@ -1,6 +1,3 @@
-import os from "node:os"
-import path from "node:path"
-
 export type UsageWindow = {
   label: "5h" | "wk" | "mo"
   pct: number
@@ -19,16 +16,25 @@ type OauthEntry = {
   accountId?: string
 }
 
-const AUTH_PATH = path.join(
-  process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"),
-  "opencode",
-  "auth.json",
-)
-
 async function readAuth(): Promise<Record<string, OauthEntry>> {
-  return Bun.file(AUTH_PATH)
-    .json()
-    .catch(() => ({}))
+  const child = Bun.spawn(["opencode", "auth", "export"], { stdout: "pipe", stderr: "inherit" })
+  const data: unknown = await new Response(child.stdout).json()
+  if (await child.exited !== 0 || !Array.isArray(data)) throw new Error("Cannot read OpenCode credentials")
+  return Object.fromEntries(data.flatMap((entry: unknown) => {
+    if (!entry || typeof entry !== "object" || !("active" in entry) || entry.active !== true ||
+        !("integrationID" in entry) || typeof entry.integrationID !== "string" || !("value" in entry)) return []
+    const value = entry.value
+    if (!value || typeof value !== "object" || !("type" in value) || value.type !== "oauth" ||
+        !("access" in value) || typeof value.access !== "string") return []
+    const metadata = "metadata" in value ? value.metadata : undefined
+    const accountId = metadata && typeof metadata === "object" && "accountID" in metadata ? metadata.accountID : undefined
+    return [[entry.integrationID, {
+      type: "oauth",
+      access: value.access,
+      expires: "expires" in value && typeof value.expires === "number" ? value.expires : undefined,
+      accountId: typeof accountId === "string" ? accountId : undefined,
+    }]]
+  }))
 }
 
 function oauthEntry(auth: Record<string, OauthEntry>, provider: string) {
@@ -149,8 +155,8 @@ async function fetchCursor(auth: Record<string, OauthEntry>, signal?: AbortSigna
 const FETCHERS = [fetchOpenai, fetchAnthropic, fetchCursor]
 
 /** Fetch usage for all configured providers. Never throws; failures become `error` entries. */
-export async function collectUsage(signal?: AbortSignal): Promise<ProviderUsage[]> {
-  const auth = await readAuth()
+export async function collectUsage(signal?: AbortSignal, credentials?: Record<string, OauthEntry>): Promise<ProviderUsage[]> {
+  const auth = credentials ?? await readAuth()
   const names = ["openai", "anthropic", "cursor"]
   const results = await Promise.allSettled(FETCHERS.map((fetcher) => fetcher(auth, signal)))
   return results.flatMap((result, index) => {
